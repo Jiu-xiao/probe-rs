@@ -340,6 +340,11 @@ pub trait SwdProbe: DebugProbe {
         false
     }
 
+    /// Report whether the probe runs DP and AP transfers over JTAG, when JTAG is active.
+    fn transfers_over_jtag(&self) -> bool {
+        false
+    }
+
     /// Returns the SWD wire-protocol timing settings used by this probe.
     fn swd_settings(&self) -> SwdSettings {
         SwdSettings::default()

@@ -9,7 +9,7 @@ use crate::{
         arm::{
             ArmCommunicationInterface, ArmDebugInterface, ArmError, DapError, SwoAccess, SwoConfig,
             SwoMode,
-            dp::{Abort, Ctrl, DpRegister},
+            dp::{Abort, Ctrl, DpRegister, DpRegisterAddress},
             sequences::ArmDebugSequence,
             swo::poll_interval_from_buf_size,
         },
@@ -22,12 +22,13 @@ use crate::{
         },
     },
     probe::{
-        DebugProbe, DebugProbeError, DebugProbeSelector, JtagChain, JtagChainAccess,
+        BatchError, DebugProbe, DebugProbeError, DebugProbeSelector, JtagChain, JtagChainAccess,
         JtagChainState, ProbeFactory, WireProtocol,
         cmsisdap::commands::{
             CmsisDapError, RequestError,
             general::info::{CapabilitiesCommand, PacketCountCommand, SWOTraceBufferSizeCommand},
         },
+        jtag::{JtagBatch, JtagProbe, TapState},
         swd::SwdProbe,
     },
 };
@@ -55,7 +56,7 @@ use commands::{
         sequence::{SequenceRequest, SequenceResponse},
     },
     swo,
-    transfer::{Ack, TransferRequest, configure::ConfigureRequest},
+    transfer::{Ack, TransferRequest, configure::ConfigureRequest, write_abort::WriteAbortRequest},
 };
 use probe_rs_target::ScanChainElement;
 
@@ -533,7 +534,39 @@ impl CmsisDap {
     }
 
     fn write_abort(&mut self, abort: Abort) -> Result<(), ArmError> {
-        let mut request = TransferRequest::write(Abort::ADDRESS, abort.into());
+        if self.protocol == Some(WireProtocol::Jtag) {
+            // A JTAG-DP has DAPABORT only, and clears its sticky flags through CTRL/STAT. The
+            // abort goes first, CTRL/STAT answers WAIT while an AP transaction is stuck.
+            let value = u32::from(abort);
+            if value & 1 != 0 {
+                let request = WriteAbortRequest {
+                    dap_index: self.jtag_state.chain_params.index as u8,
+                    value: 1,
+                };
+                let status = commands::send_command(&mut self.device, &request)
+                    .map_err(DebugProbeError::from)?;
+                if status == Status::DapError {
+                    return Err(DebugProbeError::from(CmsisDapError::ErrorResponse(
+                        RequestError::WriteAbort { request },
+                    ))
+                    .into());
+                }
+            }
+            if value & !1 != 0 {
+                self.clear_jtag_sticky_err()?;
+            }
+            return Ok(());
+        }
+
+        self.write_dp_register(Abort::ADDRESS, abort.into())
+    }
+
+    fn write_dp_register(
+        &mut self,
+        address: DpRegisterAddress,
+        value: u32,
+    ) -> Result<(), ArmError> {
+        let mut request = TransferRequest::write(address, value);
         request.dap_index = self.jtag_state.chain_params.index as u8;
         let response =
             commands::send_command(&mut self.device, &request).map_err(DebugProbeError::from)?;
@@ -562,6 +595,10 @@ impl CmsisDap {
     // Reads the CTRL/STAT register, and clears the sticky error flag if is set (or if the read
     // faults, which shouldn't happen, but is observed to happen on some PSOC devices).
     fn handle_sticky_err(&mut self) -> Result<(), ArmError> {
+        if self.protocol == Some(WireProtocol::Jtag) {
+            return self.clear_jtag_sticky_err();
+        }
+
         let ctrl = self.read_ctrl_register();
         tracing::trace!("Ctrl/Stat register value is: {:?}", ctrl);
 
@@ -577,6 +614,34 @@ impl CmsisDap {
             }
             Err(e) => Err(e),
         }
+    }
+
+    /// Clears the sticky error flags of a JTAG-DP.
+    ///
+    /// JTAG has no FAULT acknowledge and its ABORT register has no STKERRCLR, so a failed access
+    /// only shows in CTRL/STAT, and its flags are cleared by writing them back.
+    fn clear_jtag_sticky_err(&mut self) -> Result<(), ArmError> {
+        let ctrl = self.read_ctrl_register()?;
+        if ctrl.sticky_err() {
+            self.write_dp_register(Ctrl::ADDRESS, ctrl.into())?;
+        }
+        Ok(())
+    }
+
+    /// Puts the TAP in Run-Test/Idle, where `DAP_Transfer` over JTAG starts and ends.
+    ///
+    /// Only JTAG operations of our own can leave it somewhere else.
+    pub(crate) fn enter_run_test_idle(&mut self) -> Result<(), DebugProbeError> {
+        if self.jtag_state.tap_state == TapState::RunTestIdle {
+            return Ok(());
+        }
+        let mut batch = JtagBatch::new();
+        batch.enter(TapState::RunTestIdle);
+        JtagProbe::run_batch(self, &batch)
+            .map(drop)
+            .map_err(|error| match error.error {
+                BatchError::Probe(error) | BatchError::Specific(error) => error,
+            })
     }
 
     /// Set SWO port to use requested transport.
