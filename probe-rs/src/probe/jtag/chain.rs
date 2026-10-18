@@ -91,6 +91,10 @@ impl<'p> JtagChain<'p> {
         Self { probe }
     }
 
+    pub(crate) fn native_dap_access(&mut self) -> Option<&mut dyn super::dap::NativeDapAccess> {
+        self.probe.native_dap_access()
+    }
+
     /// Configure padding for the TAP at `tap`.
     ///
     /// Measures the scan chain when it is not known yet.

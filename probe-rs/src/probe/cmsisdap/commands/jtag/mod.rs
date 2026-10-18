@@ -2,12 +2,12 @@ use bitvec::{bitvec, slice::BitSlice, vec::BitVec};
 
 use crate::probe::{
     Batch, BatchExecutionError, DebugProbeError, JtagChainAccess, JtagChainState, JtagOp,
-    JtagProbe, Results,
+    JtagProbe, Results, WireProtocol,
     cmsisdap::{
         CmsisDap,
         commands::jtag::sequence::{Sequence, SequenceRequest},
     },
-    jtag::{Step, TapState, distribute_captures, tms_runs, walk_batch},
+    jtag::{Step, TapState, dap::NativeDapAccess, distribute_captures, tms_runs, walk_batch},
 };
 
 pub mod configure;
@@ -25,6 +25,12 @@ impl JtagChainAccess for CmsisDap {
 
     fn chain_state_ref(&self) -> &JtagChainState {
         &self.jtag_state
+    }
+
+    fn native_dap_access(&mut self) -> Option<&mut dyn NativeDapAccess> {
+        let ready =
+            self.protocol == Some(WireProtocol::Jtag) && self.connected && self.jtag_configured;
+        ready.then_some(self as _)
     }
 }
 

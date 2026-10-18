@@ -353,6 +353,11 @@ pub trait JtagChainAccess: JtagProbe {
 
     /// Returns the driver state.
     fn chain_state_ref(&self) -> &JtagChainState;
+
+    /// Returns the probe's own JTAG-DP accesses, if it runs them in its firmware.
+    fn native_dap_access(&mut self) -> Option<&mut dyn dap::NativeDapAccess> {
+        None
+    }
 }
 
 /// Bit-banging JTAG interface for probe drivers.

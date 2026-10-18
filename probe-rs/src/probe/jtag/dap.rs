@@ -15,6 +15,19 @@ use crate::{
     },
 };
 
+/// JTAG-DP accesses that a probe runs in its firmware, instead of as scans on the chain.
+///
+/// The probe retries WAIT and clears sticky errors itself.
+pub trait NativeDapAccess {
+    /// Runs the accesses in order, a read is `None`, and lands the reads in `values`. A write to
+    /// ABORT goes to the ABORT instruction.
+    fn access_registers(
+        &mut self,
+        accesses: &[(RegisterAddress, Option<u32>)],
+        values: &mut [u32],
+    ) -> Result<(), ArmError>;
+}
+
 // Constant to be written to ABORT
 const JTAG_ABORT_VALUE: u64 = 0x8;
 
@@ -447,17 +460,9 @@ pub(crate) fn jtag_read_register(
     address: RegisterAddress,
     settings: &SwdSettings,
 ) -> Result<u32, ArmError> {
-    let mut transfer = DapTransfer::read(address);
-    perform_jtag_transfers_with_retry(chain, std::slice::from_mut(&mut transfer), settings)?;
-
-    match transfer.status {
-        TransferStatus::Ok => Ok(transfer.value),
-        TransferStatus::Failed(DapError::FaultResponse) => Err(DapError::FaultResponse.into()),
-        TransferStatus::Failed(error) => Err(error.into()),
-        other => {
-            panic!("Unexpected transfer state after reading register: {other:?}. This is a bug!")
-        }
-    }
+    let mut value = [0];
+    jtag_access_registers(chain, &[(address, None)], &mut value, settings)?;
+    Ok(value[0])
 }
 
 pub(crate) fn jtag_write_register(
@@ -466,17 +471,7 @@ pub(crate) fn jtag_write_register(
     value: u32,
     settings: &SwdSettings,
 ) -> Result<(), ArmError> {
-    let mut transfer = DapTransfer::write(address, value);
-    perform_jtag_transfers_with_retry(chain, std::slice::from_mut(&mut transfer), settings)?;
-
-    match transfer.status {
-        TransferStatus::Ok => Ok(()),
-        TransferStatus::Failed(DapError::FaultResponse) => Err(DapError::FaultResponse.into()),
-        TransferStatus::Failed(error) => Err(error.into()),
-        other => {
-            panic!("Unexpected transfer state after writing register: {other:?}. This is a bug!")
-        }
-    }
+    jtag_access_registers(chain, &[(address, Some(value))], &mut [], settings)
 }
 
 pub(crate) fn jtag_read_block(
@@ -485,20 +480,8 @@ pub(crate) fn jtag_read_block(
     values: &mut [u32],
     settings: &SwdSettings,
 ) -> Result<(), ArmError> {
-    let mut transfers = vec![DapTransfer::read(address); values.len()];
-    perform_jtag_transfers_with_retry(chain, &mut transfers, settings)?;
-
-    for (index, transfer) in transfers.iter().enumerate() {
-        match transfer.status {
-            TransferStatus::Ok => values[index] = transfer.value,
-            TransferStatus::Failed(error) => return Err(error.into()),
-            other => panic!(
-                "Unexpected transfer state after reading registers: {other:?}. This is a bug!"
-            ),
-        }
-    }
-
-    Ok(())
+    let accesses = vec![(address, None); values.len()];
+    jtag_access_registers(chain, &accesses, values, settings)
 }
 
 pub(crate) fn jtag_write_block(
@@ -507,22 +490,47 @@ pub(crate) fn jtag_write_block(
     values: &[u32],
     settings: &SwdSettings,
 ) -> Result<(), ArmError> {
-    let mut transfers = values
-        .iter()
-        .map(|value| DapTransfer::write(address, *value))
-        .collect::<Vec<_>>();
-    perform_jtag_transfers_with_retry(chain, &mut transfers, settings)?;
+    let accesses: Vec<_> = values.iter().map(|&value| (address, Some(value))).collect();
+    jtag_access_registers(chain, &accesses, &mut [], settings)
+}
 
-    for transfer in &transfers {
-        match transfer.status {
-            TransferStatus::Ok => {}
-            TransferStatus::Failed(error) => return Err(error.into()),
-            other => panic!(
-                "Unexpected transfer state after writing registers: {other:?}. This is a bug!"
-            ),
-        }
+/// Runs DP and AP accesses in order, a read is `None`, and lands the reads in `values`.
+///
+/// The probe's own JTAG-DP accesses run them when it has them, otherwise they are scans on the
+/// chain.
+pub(crate) fn jtag_access_registers(
+    chain: &mut JtagChain<'_>,
+    accesses: &[(RegisterAddress, Option<u32>)],
+    values: &mut [u32],
+    settings: &SwdSettings,
+) -> Result<(), ArmError> {
+    if let Some(dap) = chain.native_dap_access() {
+        return dap.access_registers(accesses, values);
     }
 
+    let mut transfers: Vec<_> = accesses
+        .iter()
+        .map(|&(address, value)| match value {
+            Some(value) => DapTransfer::write(address, value),
+            None => DapTransfer::read(address),
+        })
+        .collect();
+    perform_jtag_transfers_with_retry(chain, &mut transfers, settings)?;
+
+    let mut values = values.iter_mut();
+    for transfer in &transfers {
+        match transfer.status {
+            TransferStatus::Ok => {
+                if transfer.direction == TransferDirection::Read {
+                    *values.next().expect("every read needs a word to land in") = transfer.value;
+                }
+            }
+            TransferStatus::Failed(error) => return Err(error.into()),
+            other => {
+                panic!("Unexpected transfer state after the accesses: {other:?}. This is a bug!")
+            }
+        }
+    }
     Ok(())
 }
 
